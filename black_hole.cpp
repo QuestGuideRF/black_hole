@@ -1,0 +1,711 @@
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <vector>
+#include <iostream>
+#define _USE_MATH_DEFINES
+#include <cmath>
+#include <sstream>
+#include <iomanip>
+#include <cstring>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+using namespace glm;
+using namespace std;
+using Clock = std::chrono::high_resolution_clock;
+
+// Переменные
+double lastPrintTime = 0.0;
+int    framesCount   = 0;
+double c = 299792458.0;
+double G = 6.67430e-11;
+struct Ray;
+bool Gravity = false;
+
+struct Camera {
+    // Центрировать орбиту камеры на черной дыре в точке (0, 0, 0)
+    vec3 target = vec3(0.0f, 0.0f, 0.0f); // Всегда смотреть в центр черной дыры
+    float radius = 6.34194e10f;
+    float minRadius = 1e10f, maxRadius = 1e12f;
+
+    float azimuth = 0.0f;
+    float elevation = M_PI / 2.0f;
+
+    float orbitSpeed = 0.01f;
+    float panSpeed = 0.01f;
+    double zoomSpeed = 25e9f;
+
+    bool dragging = false;
+    bool panning = false;
+    bool moving = false; // Для оптимизации вычислительного шейдера
+    double lastX = 0.0, lastY = 0.0;
+
+    // Рассчитать положение камеры в мировом пространстве
+    vec3 position() const {
+        float clampedElevation = glm::clamp(elevation, 0.01f, float(M_PI) - 0.01f);
+        // Всегда вращаться вокруг (0, 0, 0)
+        return vec3(
+            radius * sin(clampedElevation) * cos(azimuth),
+            radius * cos(clampedElevation),
+            radius * sin(clampedElevation) * sin(azimuth)
+        );
+    }
+    void update() {
+        // Всегда держать цель в центре черной дыры
+        target = vec3(0.0f, 0.0f, 0.0f);
+        if(dragging | panning) {
+            moving = true;
+        } else {
+            moving = false;
+        }
+    }
+
+    void processMouseMove(double x, double y) {
+        float dx = float(x - lastX);
+        float dy = float(y - lastY);
+
+        if (dragging && panning) {
+            // Панорамирование: Shift + левая или средняя кнопка мыши
+            // Панорамирование отключено, чтобы камера оставалась центрированной на черной дыре
+        }
+        else if (dragging && !panning) {
+            // Орбитальное вращение: только левая кнопка мыши
+            azimuth   += dx * orbitSpeed;
+            elevation -= dy * orbitSpeed;
+            elevation = glm::clamp(elevation, 0.01f, float(M_PI) - 0.01f);
+        }
+
+        lastX = x;
+        lastY = y;
+        update();
+    }
+    void processMouseButton(int button, int action, int mods, GLFWwindow* win) {
+        if (button == GLFW_MOUSE_BUTTON_LEFT || button == GLFW_MOUSE_BUTTON_MIDDLE) {
+            if (action == GLFW_PRESS) {
+                dragging = true;
+                // Отключить панорамирование, чтобы камера всегда вращалась вокруг центра
+                panning = false;
+                glfwGetCursorPos(win, &lastX, &lastY);
+            } else if (action == GLFW_RELEASE) {
+                dragging = false;
+                panning = false;
+            }
+        }
+        if (button == GLFW_MOUSE_BUTTON_RIGHT) {
+            if (action == GLFW_PRESS) {
+                Gravity = true;
+            } else if (action == GLFW_RELEASE) {
+                Gravity = false;
+            }
+        }
+    }
+    void processScroll(double xoffset, double yoffset) {
+        radius -= yoffset * zoomSpeed;
+        radius = glm::clamp(radius, minRadius, maxRadius);
+        update();
+    }
+    void processKey(int key, int scancode, int action, int mods) {
+        if (action == GLFW_PRESS && key == GLFW_KEY_G) {
+            Gravity = !Gravity;
+            cout << "[ИНФО] Гравитация " << (Gravity ? "включена" : "выключена") << endl;
+        }
+    }
+};
+Camera camera;
+
+struct BlackHole {
+    vec3 position;
+    double mass;
+    double radius;
+    double r_s;
+
+    BlackHole(vec3 pos, float m) : position(pos), mass(m) {r_s = 2.0 * G * mass / (c*c);}
+    bool Intercept(float px, float py, float pz) const {
+        double dx = double(px) - double(position.x);
+        double dy = double(py) - double(position.y);
+        double dz = double(pz) - double(position.z);
+        double dist2 = dx * dx + dy * dy + dz * dz;
+        return dist2 < r_s * r_s;
+    }
+};
+BlackHole SagA(vec3(0.0f, 0.0f, 0.0f), 8.54e36); // Черная дыра Стрелец A*
+struct ObjectData {
+    vec4 posRadius; // xyz = положение, w = радиус
+    vec4 color;     // rgb = цвет, a = не используется
+    float  mass;
+    vec3 velocity = vec3(0.0f, 0.0f, 0.0f); // Начальная скорость
+};
+vector<ObjectData> objects = {
+    { vec4(4e11f, 0.0f, 0.0f, 4e10f)   , vec4(1,1,0,1), 1.98892e30 },
+    { vec4(0.0f, 0.0f, 4e11f, 4e10f)   , vec4(1,0,0,1), 1.98892e30 },
+    { vec4(0.0f, 0.0f, 0.0f, SagA.r_s) , vec4(0,0,0,1), static_cast<float>(SagA.mass)  },
+    //{ vec4(6e10f, 0.0f, 0.0f, 5e10f), vec4(0,1,0,1) }
+};
+
+struct Engine {
+    GLuint gridShaderProgram;
+    // -- Отрисовка квадрата и текстуры -- //
+    GLFWwindow* window;
+    GLuint quadVAO;
+    GLuint texture;
+    GLuint shaderProgram;
+    GLuint computeProgram = 0;
+    // -- UBO -- //
+    GLuint cameraUBO = 0;
+    GLuint diskUBO = 0;
+    GLuint objectsUBO = 0;
+    // -- Переменные сетки -- //
+    GLuint gridVAO = 0;
+    GLuint gridVBO = 0;
+    GLuint gridEBO = 0;
+    int gridIndexCount = 0;
+
+    int WIDTH = 800;  // Ширина окна
+    int HEIGHT = 600; // Высота окна
+    int COMPUTE_WIDTH  = 200;  // Ширина разрешения вычислительного шейдера
+    int COMPUTE_HEIGHT = 150;  // Высота разрешения вычислительного шейдера
+    float width = 100000000000.0f; // Ширина области просмотра в метрах
+    float height = 75000000000.0f; // Высота области просмотра в метрах
+    
+    Engine() {
+        if (!glfwInit()) {
+            cerr << "Не удалось инициализировать GLFW\n";
+            exit(EXIT_FAILURE);
+        }
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        window = glfwCreateWindow(WIDTH, HEIGHT, "Черная дыра", nullptr, nullptr);
+        if (!window) {
+            cerr << "Не удалось создать окно GLFW\n";
+            glfwTerminate();
+            exit(EXIT_FAILURE);
+        }
+        glfwMakeContextCurrent(window);
+        glewExperimental = GL_TRUE;
+        GLenum glewErr = glewInit();
+        if (glewErr != GLEW_OK) {
+            cerr << "Не удалось инициализировать GLEW: "
+                << (const char*)glewGetErrorString(glewErr)
+                << "\n";
+            glfwTerminate();
+            exit(EXIT_FAILURE);
+        }
+        cout << "OpenGL " << glGetString(GL_VERSION) << "\n";
+        this->shaderProgram = CreateShaderProgram();
+        gridShaderProgram = CreateShaderProgram("grid.vert", "grid.frag");
+
+        computeProgram = CreateComputeProgram("geodesic.comp");
+        glGenBuffers(1, &cameraUBO);
+        glBindBuffer(GL_UNIFORM_BUFFER, cameraUBO);
+        glBufferData(GL_UNIFORM_BUFFER, 128, nullptr, GL_DYNAMIC_DRAW); // Выделить около 128 байт
+        glBindBufferBase(GL_UNIFORM_BUFFER, 1, cameraUBO); // Привязка 1 соответствует шейдеру
+
+        glGenBuffers(1, &diskUBO);
+        glBindBuffer(GL_UNIFORM_BUFFER, diskUBO);
+        glBufferData(GL_UNIFORM_BUFFER, sizeof(float) * 4, nullptr, GL_DYNAMIC_DRAW); // 3 значения + 1 выравнивание
+        glBindBufferBase(GL_UNIFORM_BUFFER, 2, diskUBO); // Привязка 2 соответствует вычислительному шейдеру
+
+        glGenBuffers(1, &objectsUBO);
+        glBindBuffer(GL_UNIFORM_BUFFER, objectsUBO);
+        // Выделить место для 16 объектов:
+        // sizeof(int) + выравнивание + 16 x (vec4 posRadius + vec4 color)
+        GLsizeiptr objUBOSize = sizeof(int) + 3 * sizeof(float)
+            + 16 * (sizeof(vec4) + sizeof(vec4))
+            + 16 * sizeof(float); // 16 чисел float для массы
+        glBufferData(GL_UNIFORM_BUFFER, objUBOSize, nullptr, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 3, objectsUBO);  // Привязка 3 соответствует шейдеру
+
+        auto result = QuadVAO();
+        this->quadVAO = result[0];
+        this->texture = result[1];
+    }
+    void generateGrid(const vector<ObjectData>& objects) {
+        const int gridSize = 25;
+        const float spacing = 1e10f;  // Настраиваемый шаг сетки
+
+        vector<vec3> vertices;
+        vector<GLuint> indices;
+
+        for (int z = 0; z <= gridSize; ++z) {
+            for (int x = 0; x <= gridSize; ++x) {
+                float worldX = (x - gridSize / 2) * spacing;
+                float worldZ = (z - gridSize / 2) * spacing;
+
+                float y = 0.0f;
+
+                // Искривить сетку с помощью геометрии Шварцшильда
+                for (const auto& obj : objects) {
+                    vec3 objPos = vec3(obj.posRadius);
+                    double mass = obj.mass;
+                    double radius = obj.posRadius.w;
+
+                    double r_s = 2.0 * G * mass / (c * c);
+                    double dx = worldX - objPos.x;
+                    double dz = worldZ - objPos.z;
+                    double dist = sqrt(dx * dx + dz * dz);
+
+                    // Не допустить корень из отрицательного числа или деление на ноль
+                    // внутри горизонта событий или в центре черной дыры
+                    if (dist > r_s) {
+                        double deltaY = 2.0 * sqrt(r_s * (dist - r_s));
+                        y += static_cast<float>(deltaY) - 3e10f;
+                    } else {
+                        // Для точек внутри или на r_s: резко опустить сетку вниз
+                        y += 2.0f * static_cast<float>(sqrt(r_s * r_s)) - 3e10f;  // Можно сделать глубокую воронку
+                    }
+                }
+
+                vertices.emplace_back(worldX, y, worldZ);
+            }
+        }
+
+        // Добавить индексы для отрисовки GL_LINE
+        for (int z = 0; z < gridSize; ++z) {
+            for (int x = 0; x < gridSize; ++x) {
+                int i = z * (gridSize + 1) + x;
+                indices.push_back(i);
+                indices.push_back(i + 1);
+
+                indices.push_back(i);
+                indices.push_back(i + gridSize + 1);
+            }
+        }
+
+        // Загрузить данные на GPU
+        if (gridVAO == 0) glGenVertexArrays(1, &gridVAO);
+        if (gridVBO == 0) glGenBuffers(1, &gridVBO);
+        if (gridEBO == 0) glGenBuffers(1, &gridEBO);
+
+        glBindVertexArray(gridVAO);
+
+        glBindBuffer(GL_ARRAY_BUFFER, gridVBO);
+        glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(vec3), vertices.data(), GL_DYNAMIC_DRAW);
+
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gridEBO);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(GLuint), indices.data(), GL_STATIC_DRAW);
+
+        glEnableVertexAttribArray(0); // location = 0
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(vec3), (void*)0);
+
+        gridIndexCount = indices.size();
+
+        glBindVertexArray(0);
+    }
+    void drawGrid(const mat4& viewProj) {
+        glUseProgram(gridShaderProgram);
+        glUniformMatrix4fv(glGetUniformLocation(gridShaderProgram, "viewProj"),
+                        1, GL_FALSE, glm::value_ptr(viewProj));
+        glBindVertexArray(gridVAO);
+
+        glDisable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        glDrawElements(GL_LINES, gridIndexCount, GL_UNSIGNED_INT, 0);
+
+        glBindVertexArray(0);
+        glEnable(GL_DEPTH_TEST);
+    }
+    void drawFullScreenQuad() {
+        glUseProgram(shaderProgram); // Фрагментный и вершинный шейдеры
+        glBindVertexArray(quadVAO);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glUniform1i(glGetUniformLocation(shaderProgram, "screenTexture"), 0);
+
+        glDisable(GL_DEPTH_TEST);  // Нарисовать как фон
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 6);  // 2 треугольника
+        glEnable(GL_DEPTH_TEST);
+    }
+    GLuint CreateShaderProgram(){
+        const char* vertexShaderSource = R"(
+        #version 330 core
+        layout (location = 0) in vec2 aPos;  // Изменено на vec2
+        layout (location = 1) in vec2 aTexCoord;
+        out vec2 TexCoord;
+        void main() {
+            gl_Position = vec4(aPos, 0.0, 1.0);  // Явное z=0
+            TexCoord = aTexCoord;
+        })";
+
+        const char* fragmentShaderSource = R"(
+        #version 330 core
+        in vec2 TexCoord;
+        out vec4 FragColor;
+        uniform sampler2D screenTexture;
+        void main() {
+            FragColor = texture(screenTexture, TexCoord);
+        })";
+
+        // Вершинный шейдер
+        GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vertexShader, 1, &vertexShaderSource, nullptr);
+        glCompileShader(vertexShader);
+
+        // Фрагментный шейдер
+        GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fragmentShader, 1, &fragmentShaderSource, nullptr);
+        glCompileShader(fragmentShader);
+
+        GLuint shaderProgram = glCreateProgram();
+        glAttachShader(shaderProgram, vertexShader);
+        glAttachShader(shaderProgram, fragmentShader);
+        glLinkProgram(shaderProgram);
+
+        glDeleteShader(vertexShader);
+        glDeleteShader(fragmentShader);
+
+        return shaderProgram;
+    };
+    GLuint CreateShaderProgram(const char* vertPath, const char* fragPath) {
+        auto loadShader = [](const char* path, GLenum type) -> GLuint {
+            std::ifstream in(path);
+            if (!in.is_open()) {
+                std::cerr << "Не удалось открыть шейдер: " << path << "\n";
+                exit(EXIT_FAILURE);
+            }
+            std::stringstream ss;
+            ss << in.rdbuf();
+            std::string srcStr = ss.str();
+            const char* src = srcStr.c_str();
+
+            GLuint shader = glCreateShader(type);
+            glShaderSource(shader, 1, &src, nullptr);
+            glCompileShader(shader);
+
+            GLint success;
+            glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+            if (!success) {
+                GLint logLen;
+                glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLen);
+                std::vector<char> log(logLen);
+                glGetShaderInfoLog(shader, logLen, nullptr, log.data());
+                std::cerr << "Ошибка компиляции шейдера (" << path << "):\n" << log.data() << "\n";
+                exit(EXIT_FAILURE);
+            }
+            return shader;
+        };
+
+        GLuint vertShader = loadShader(vertPath, GL_VERTEX_SHADER);
+        GLuint fragShader = loadShader(fragPath, GL_FRAGMENT_SHADER);
+
+        GLuint program = glCreateProgram();
+        glAttachShader(program, vertShader);
+        glAttachShader(program, fragShader);
+        glLinkProgram(program);
+
+        GLint linkSuccess;
+        glGetProgramiv(program, GL_LINK_STATUS, &linkSuccess);
+        if (!linkSuccess) {
+            GLint logLen;
+            glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLen);
+            std::vector<char> log(logLen);
+            glGetProgramInfoLog(program, logLen, nullptr, log.data());
+            std::cerr << "Ошибка линковки шейдера:\n" << log.data() << "\n";
+            exit(EXIT_FAILURE);
+        }
+
+        glDeleteShader(vertShader);
+        glDeleteShader(fragShader);
+
+        return program;
+    }
+    GLuint CreateComputeProgram(const char* path) {
+        // 1) Прочитать исходный код GLSL
+        std::ifstream in(path);
+        if(!in.is_open()) {
+            std::cerr << "Не удалось открыть вычислительный шейдер: " << path << "\n";
+            exit(EXIT_FAILURE);
+        }
+        std::stringstream ss;
+        ss << in.rdbuf();
+        std::string srcStr = ss.str();
+        const char* src = srcStr.c_str();
+
+        // 2) Скомпилировать
+        GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
+        glShaderSource(cs, 1, &src, nullptr);
+        glCompileShader(cs);
+        GLint ok; 
+        glGetShaderiv(cs, GL_COMPILE_STATUS, &ok);
+        if(!ok) {
+            GLint logLen;
+            glGetShaderiv(cs, GL_INFO_LOG_LENGTH, &logLen);
+            std::vector<char> log(logLen);
+            glGetShaderInfoLog(cs, logLen, nullptr, log.data());
+            std::cerr << "Ошибка компиляции вычислительного шейдера:\n" << log.data() << "\n";
+            exit(EXIT_FAILURE);
+        }
+
+        // 3) Слинковать
+        GLuint prog = glCreateProgram();
+        glAttachShader(prog, cs);
+        glLinkProgram(prog);
+        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if(!ok) {
+            GLint logLen;
+            glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &logLen);
+            std::vector<char> log(logLen);
+            glGetProgramInfoLog(prog, logLen, nullptr, log.data());
+            std::cerr << "Ошибка линковки вычислительного шейдера:\n" << log.data() << "\n";
+            exit(EXIT_FAILURE);
+        }
+
+        glDeleteShader(cs);
+        return prog;
+    }
+    void dispatchCompute(const Camera& cam) {
+        // Определить целевое разрешение вычислительного шейдера
+        int cw = cam.moving ? COMPUTE_WIDTH  : 200;
+        int ch = cam.moving ? COMPUTE_HEIGHT : 150;
+
+        // 1) При необходимости заново выделить текстуру
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexImage2D(GL_TEXTURE_2D,
+                    0,                // mip-уровень
+                    GL_RGBA8,         // Внутренний формат
+                    cw,               // Ширина
+                    ch,               // Высота
+                    0, GL_RGBA, 
+                    GL_UNSIGNED_BYTE, 
+                    nullptr);
+
+        // 2) Привязать программу вычислительного шейдера и UBO
+        glUseProgram(computeProgram);
+        uploadCameraUBO(cam);
+        uploadDiskUBO();
+        uploadObjectsUBO(objects);
+
+        // 3) Привязать текстуру как image unit 0
+        glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+
+        // 4) Запустить сетку вычислительного шейдера
+        GLuint groupsX = (GLuint)std::ceil(cw / 16.0f);
+        GLuint groupsY = (GLuint)std::ceil(ch / 16.0f);
+        glDispatchCompute(groupsX, groupsY, 1);
+
+        // 5) Синхронизировать
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    }
+    void uploadCameraUBO(const Camera& cam) {
+        struct UBOData {
+            vec3 pos; float _pad0;
+            vec3 right; float _pad1;
+            vec3 up; float _pad2;
+            vec3 forward; float _pad3;
+            float tanHalfFov;
+            float aspect;
+            bool moving;
+            int _pad4;
+        } data;
+        vec3 fwd = normalize(cam.target - cam.position());
+        vec3 up = vec3(0, 1, 0); // Ось y направлена вверх, поэтому диск лежит в плоскости x-z
+        vec3 right = normalize(cross(fwd, up));
+        up = cross(right, fwd);
+
+        data.pos = cam.position();
+        data.right = right;
+        data.up = up;
+        data.forward = fwd;
+        data.tanHalfFov = tan(radians(60.0f * 0.5f));
+        data.aspect = float(WIDTH) / float(HEIGHT);
+        data.moving = cam.dragging || cam.panning;
+
+        glBindBuffer(GL_UNIFORM_BUFFER, cameraUBO);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(UBOData), &data);
+    }
+    void uploadObjectsUBO(const vector<ObjectData>& objs) {
+        struct UBOData {
+            int   numObjects;
+            float _pad0, _pad1, _pad2;        // Выравнивание до 16 байт
+            vec4  posRadius[16];
+            vec4  color[16];
+            float  mass[16]; 
+        } data;
+
+        size_t count = std::min(objs.size(), size_t(16));
+        data.numObjects = static_cast<int>(count);
+
+        for (size_t i = 0; i < count; ++i) {
+            data.posRadius[i] = objs[i].posRadius;
+            data.color[i] = objs[i].color;
+            data.mass[i] = objs[i].mass;
+        }
+
+        // Загрузка
+        glBindBuffer(GL_UNIFORM_BUFFER, objectsUBO);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(data), &data);
+    }
+    void uploadDiskUBO() {
+        // Диск
+        float r1 = SagA.r_s * 2.2f;    // Внутренний радиус сразу за горизонтом событий
+        float r2 = SagA.r_s * 5.2f;    // Внешний радиус диска
+        float num = 2.0;               // Количество лучей
+        float thickness = 1e9f;        // Выравнивание для std140
+        float diskData[4] = { r1, r2, num, thickness };
+
+        glBindBuffer(GL_UNIFORM_BUFFER, diskUBO);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(diskData), diskData);
+    }
+    
+    vector<GLuint> QuadVAO(){
+        float quadVertices[] = {
+            // Позиции    // Текстурные координаты
+            -1.0f,  1.0f,  0.0f, 1.0f,  // Верхний левый угол
+            -1.0f, -1.0f,  0.0f, 0.0f,  // Нижний левый угол
+            1.0f, -1.0f,  1.0f, 0.0f,  // Нижний правый угол
+
+            -1.0f,  1.0f,  0.0f, 1.0f,  // Верхний левый угол
+            1.0f, -1.0f,  1.0f, 0.0f,  // Нижний правый угол
+            1.0f,  1.0f,  1.0f, 1.0f   // Верхний правый угол
+        };
+        
+        GLuint VAO, VBO;
+        glGenVertexArrays(1, &VAO);
+        glGenBuffers(1, &VBO);
+
+        glBindVertexArray(VAO);
+        glBindBuffer(GL_ARRAY_BUFFER, VBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
+
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+
+        GLuint texture;
+        glGenTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexImage2D(GL_TEXTURE_2D,
+                    0,             // mip-уровень
+                    GL_RGBA8,      // Внутренний формат
+                    COMPUTE_WIDTH,
+                    COMPUTE_HEIGHT,
+                    0,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    nullptr);
+        vector<GLuint> VAOtexture = {VAO, texture};
+        return VAOtexture;
+    }
+    void renderScene() {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glUseProgram(shaderProgram);
+        glBindVertexArray(quadVAO);
+        // Убедиться, что фрагментный шейдер берет данные из texture unit 0
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    };
+};
+Engine engine;
+void setupCameraCallbacks(GLFWwindow* window) {
+    glfwSetWindowUserPointer(window, &camera);
+
+    glfwSetMouseButtonCallback(window, [](GLFWwindow* win, int button, int action, int mods) {
+        Camera* cam = (Camera*)glfwGetWindowUserPointer(win);
+        cam->processMouseButton(button, action, mods, win);
+    });
+
+    glfwSetCursorPosCallback(window, [](GLFWwindow* win, double x, double y) {
+        Camera* cam = (Camera*)glfwGetWindowUserPointer(win);
+        cam->processMouseMove(x, y);
+    });
+
+    glfwSetScrollCallback(window, [](GLFWwindow* win, double xoffset, double yoffset) {
+        Camera* cam = (Camera*)glfwGetWindowUserPointer(win);
+        cam->processScroll(xoffset, yoffset);
+    });
+
+    glfwSetKeyCallback(window, [](GLFWwindow* win, int key, int scancode, int action, int mods) {
+        Camera* cam = (Camera*)glfwGetWindowUserPointer(win);
+        cam->processKey(key, scancode, action, mods);
+    });
+}
+
+
+// -- Главная функция -- //
+int main() {
+    setupCameraCallbacks(engine.window);
+    vector<unsigned char> pixels(engine.WIDTH * engine.HEIGHT * 3);
+
+    auto t0 = Clock::now();
+    lastPrintTime = chrono::duration<double>(t0.time_since_epoch()).count();
+
+    double lastTime = glfwGetTime();
+    int   renderW  = 800, renderH = 600, numSteps = 80000;
+    while (!glfwWindowShouldClose(engine.window)) {
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);  // Необязательно, но полезно
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        double now   = glfwGetTime();
+        double dt    = now - lastTime;   // Секунды с предыдущего кадра
+        lastTime     = now;
+
+        // Гравитация
+        for (auto& obj : objects) {
+            for (auto& obj2 : objects) {
+                if (&obj == &obj2) continue; // Пропустить взаимодействие объекта с самим собой
+                 float dx  = obj2.posRadius.x - obj.posRadius.x;
+                 float dy = obj2.posRadius.y - obj.posRadius.y;
+                 float dz = obj2.posRadius.z - obj.posRadius.z;
+                 float distance = sqrt(dx * dx + dy * dy + dz * dz);
+                 if (distance > 0) {
+                        vector<double> direction = {dx / distance, dy / distance, dz / distance};
+                        //distance *= 1000;
+                        double Gforce = (G * obj.mass * obj2.mass) / (distance * distance);
+
+                        double acc1 = Gforce / obj.mass;
+                        std::vector<double> acc = {direction[0] * acc1, direction[1] * acc1, direction[2] * acc1};
+                        if (Gravity) {
+                            obj.velocity.x += acc[0];
+                            obj.velocity.y += acc[1];
+                            obj.velocity.z += acc[2];
+
+                            obj.posRadius.x += obj.velocity.x;
+                            obj.posRadius.y += obj.velocity.y;
+                            obj.posRadius.z += obj.velocity.z;
+                            cout << "Скорость: " <<obj.velocity.x<<", " <<obj.velocity.y<<", " <<obj.velocity.z<<endl;
+                        }
+                    }
+            }
+        }
+
+
+
+        // ---------- СЕТКА ------------- //
+        // 2) Перестроить сетку на CPU
+        engine.generateGrid(objects);
+        // 5) Наложить искривленную сетку
+        mat4 view = lookAt(camera.position(), camera.target, vec3(0,1,0));
+        mat4 proj = perspective(radians(60.0f), float(engine.COMPUTE_WIDTH)/engine.COMPUTE_HEIGHT, 1e9f, 1e14f);
+        mat4 viewProj = proj * view;
+        engine.drawGrid(viewProj);
+
+        // ---------- ЗАПУСК ТРАССИРОВЩИКА ЛУЧЕЙ ------------- //
+        glViewport(0, 0, engine.WIDTH, engine.HEIGHT);
+        engine.dispatchCompute(camera);
+        engine.drawFullScreenQuad();
+
+        // 6) Вывести кадр на экран
+        glfwSwapBuffers(engine.window);
+        glfwPollEvents();
+    }
+
+    glfwDestroyWindow(engine.window);
+    glfwTerminate();
+    return 0;
+}
